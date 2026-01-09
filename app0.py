@@ -1,20 +1,27 @@
 import streamlit as st
 import google.generativeai as genai
+import requests
+import xml.etree.ElementTree as ET
+import json
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
 
 # -------------------------------------------------------------------------
 # [0. 시스템 설정 및 세션 초기화]
 # -------------------------------------------------------------------------
 st.set_page_config(page_title="AI 법률 마스터 (무결성 완전판)", page_icon="⚖️", layout="wide")
 
+# 세션 상태 초기화 (두 파일의 변수 모두 통합)
 if 'rec_court' not in st.session_state: st.session_state['rec_court'] = "서울중앙지방법원"
 if 'amt_in' not in st.session_state: st.session_state['amt_in'] = "30000000"
+if 'ref_case' not in st.session_state: st.session_state['ref_case'] = ""
+if 'auto_data' not in st.session_state: st.session_state['auto_data'] = {}
 
 # -------------------------------------------------------------------------
-# [1. 데이터베이스: 전국 법원 및 전국 226개 기초지자체 완벽 매핑]
+# [1. 데이터베이스: 전국 법원 및 지자체 매핑 + 마인드케어 + 시나리오]
 # -------------------------------------------------------------------------
 COURT_LIST = [
     "서울중앙지방법원", "서울동부지방법원", "서울남부지방법원", "서울북부지방법원", "서울서부지방법원",
@@ -31,7 +38,7 @@ COURT_LIST = [
     "전주지방법원", "전주지방법원 군산지원", "전주지방법원 정읍지원", "전주지방법원 남원지원", "제주지방법원"
 ]
 
-# 전국 기초자치단체 전체 매핑 (생략 없음)
+# 전국 기초자치단체 전체 매핑 (app0.py의 방대한 데이터 유지)
 JURISDICTION_MAP = {
     # --- 수도권 ---
     "종로": "서울중앙지방법원", "중구": "서울중앙지방법원", "강남": "서울중앙지방법원", "서초": "서울중앙지방법원", "관악": "서울중앙지방법원", "동작": "서울중앙지방법원",
@@ -61,7 +68,7 @@ JURISDICTION_MAP = {
     "충주": "청주지방법원 충주지원", "음성": "청주지방법원 충주지원", "제천": "청주지방법원 제천지원", "단양": "청주지방법원 제천지원", "영동": "청주지방법원 영동지원", "옥천": "청주지방법원 영동지원",
 
     # --- 영남권 ---
-    "달서": "대구지방법원 서부지원", "달성": "대구지방법원 서부지원", "대구서구": "대구지방법원 서부지원", "대구": "대구지방법원", "수성": "대구지방법원",
+    "달서": "대구지방법원 서부지원", "달성": "대구지방법원 서부지원", "대구 서구": "대구지방법원 서부지원", "대구": "대구지방법원", "수성": "대구지방법원",
     "포항": "대구지방법원 포항지원", "울릉": "대구지방법원 포항지원", "경주": "대구지방법원 경주지원", "김천": "대구지방법원 김천지원", "구미": "대구지방법원 김천지원",
     "안동": "대구지방법원 안동지원", "영주": "대구지방법원 안동지원", "상주": "대구지방법원 상주지원", "문경": "대구지방법원 상주지원", "의성": "대구지방법원 의성지원", "영덕": "대구지방법원 영덕지원", "울진": "대구지방법원 영덕지원",
     "해운대": "부산지방법원 동부지원", "부산남구": "부산지방법원 동부지원", "수영": "부산지방법원 동부지원", "기장": "부산지방법원 동부지원",
@@ -81,8 +88,7 @@ JURISDICTION_MAP = {
     "제주": "제주지방법원", "서귀포": "제주지방법원"
 }
 
-
-# 마인드 케어 DB (app0.py 로직 포함)
+# 마인드 케어 DB
 MIND_CARE_DB = {
     "start": {"advice": "시작이 반입니다. 권리 구제의 첫걸음을 응원합니다.", "music": "🎵 안정 클래식 (Bach - Air on the G String)"},
     "wait": {"advice": "법원은 증거로 말합니다. 차분히 답변서를 기다리며 증거를 재점검하세요.", "music": "🎵 편안한 재즈 (Bill Evans - Peace Piece)"},
@@ -91,15 +97,28 @@ MIND_CARE_DB = {
     "end": {"advice": "수고하셨습니다. 결과와 상관없이 당신의 정당한 권리를 위한 노력은 가치 있습니다.", "music": "🎵 휴식 음악 (Debussy - Clair de Lune)"}
 }
 
+# 시나리오 로직 (app13의 확장된 키워드 포함 통합)
 SCENARIO_LOGIC = {
     "LOAN": {"label": "💰 대여금 청구", "weights": ["빌려", "대여", "차용", "차용증"]},
     "DEPOSIT": {"label": "🏠 보증금 반환", "weights": ["보증금", "전세", "월세", "임대차"]},
-    "TORT": {"label": "🏥 손해배상", "weights": ["사고", "폭행", "피해", "과실"]}
+    "TORT": {"label": "🏥 손해배상", "weights": ["사고", "폭행", "피해", "과실"]},
+    "WAGE": {"label": "💼 임금 청구", "weights": ["임금", "월급", "퇴직금", "급여"]},
+    "SALES": {"label": "🏗️ 물품/공사대금", "weights": ["물품", "공사", "대금", "자재"]},
+    "ESTATE": {"label": "🏘️ 부동산 계약", "weights": ["부동산", "매매", "계약", "등기"]},
+    "GENERAL": {"label": "📝 일반 민사", "weights": []}
 }
 
 # -------------------------------------------------------------------------
 # [2. 지능형 로직 및 핵심 함수]
 # -------------------------------------------------------------------------
+def get_available_models(api_key):
+    """[app13] API 키가 있을 경우 사용 가능한 모델 동적 조회"""
+    if not api_key: return []
+    try:
+        genai.configure(api_key=api_key)
+        return [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+    except: return []
+
 def find_best_court(address):
     """긴 단어 우선 매칭으로 '대구 달서구' 문제 해결"""
     if not address: return "서울중앙지방법원"
@@ -109,13 +128,13 @@ def find_best_court(address):
     return "서울중앙지방법원"
 
 def detect_scenario(text):
-    """[app13] 키워드 기반 사건 유형 자동 감지"""
+    """키워드 기반 사건 유형 자동 감지 (통합 로직)"""
     scores = {k: sum(1 for w in v['weights'] if w in text) for k, v in SCENARIO_LOGIC.items()}
     best = max(scores, key=scores.get)
     return SCENARIO_LOGIC[best]['label'] if scores[best] > 0 else "📝 일반 민사"
 
 def calculate_legal_costs(amount):
-    """[app13] 정밀 인지대/송달료 수식"""
+    """정밀 인지대/송달료 수식"""
     try: amt = int(str(amount).replace(",", ""))
     except: amt = 0
     if amt <= 10000000: stamp = amt * 0.005
@@ -126,7 +145,7 @@ def calculate_legal_costs(amount):
     return amt, stamp, svc
 
 def predict_detailed_timeline(amount):
-    """[요건1] 마인드케어 결합 타임라인 생성"""
+    """마인드케어 결합 타임라인 생성"""
     amt, stamp, svc = calculate_legal_costs(amount)
     today = date.today()
     steps = [
@@ -148,7 +167,7 @@ def predict_detailed_timeline(amount):
     return timeline, amt, stamp, svc
 
 def create_evidence_list_formatted(text):
-    """[요건2] 입증방법 자동 번호 매기기"""
+    """입증방법 자동 번호 매기기"""
     if not text: return "없음"
     evs = [e.strip() for e in text.split('\n') if e.strip()]
     return "\n".join([f"갑 제{i}호증 ({v})" for i, v in enumerate(evs, 1)])
@@ -168,72 +187,98 @@ def create_docx(title, content):
     return buf
 
 # -------------------------------------------------------------------------
-# [3. 메인 UI (5대 요건 완전 통합)]
+# [3. 메인 UI (5대 요건 및 확장 기능 완전 통합)]
 # -------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 법률 AI 엔진 설정")
     api_key = st.text_input("Google API Key", type="password")
-    selected_model = st.selectbox("모델 선택", ["models/gemini-2.0-flash-exp", "models/gemini-2.5-flash", "models/gemini-1.5-pro"])
+    
+    # [app13] 모델 동적 감지 또는 [app0] 기본값
+    available_models = get_available_models(api_key)
+    default_models = ["models/gemini-2.0-flash-exp", "models/gemini-2.5-flash", "models/gemini-1.5-pro"]
+    
+    if available_models:
+        selected_model = st.selectbox("모델 선택", available_models)
+    else:
+        selected_model = st.selectbox("모델 선택", default_models)
+        
+    law_id = st.text_input("법령센터 ID (선택 - 판례검색용)")
     interest_rate = st.number_input("지연 이자율(%)", value=12.0)
     st.info("💡 **변호사 업무 보조 모드** 상시 가동 중")
 
 st.title("⚖️ AI 법률 지원 (전국 관할 & 마인드케어 최종 통합본)")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📨 관할 추천/내용증명", "📝 서류 작성(민/형사)", "🔎 증거 분석/타임라인", "⚖️ 유사 판례", "🤖 전문 상담봇"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📨 관할 추천/내용증명", "📝 서류 작성(민/형사)", "🔎 증거/타임라인", "⚖️ 유사 판례", "🤖 전문 상담봇"])
 
-# --- [TAB 1: 전국 관할 추천] ---
+# --- [TAB 1: 전국 관할 추천 & 내용증명] ---
 with tab1:
     st.subheader("📍 지능형 전국 관할 법원 매핑")
-    addr_input = st.text_input("주소(시/구 단위)를 입력하세요", placeholder="예: 대구 달서구, 부산 해운대구")
-    st.session_state.rec_court = find_best_court(addr_input)
-    st.success(f"추천 관할: **{st.session_state.rec_court}**")
+    c1, c2 = st.columns(2)
+    with c1:
+        addr_input = st.text_input("주소(시/구 단위)를 입력하세요", placeholder="예: 대구 달서구, 부산 해운대구")
+        st.session_state.rec_court = find_best_court(addr_input)
+        st.success(f"추천 관할: **{st.session_state.rec_court}**")
     
     st.divider()
     st.subheader("✉️ 내용증명 생성")
-    snd = st.text_input("발신인", "홍길동")
-    rcv = st.text_input("수신인", "김철수")
-    cd_facts = st.text_area("독촉 사유 요약")
+    col1, col2 = st.columns(2)
+    with col1:
+        snd = st.text_input("발신인", "홍길동")
+        rcv = st.text_input("수신인", "김철수")
+    with col2:
+        st.info("내용증명은 소송 전 최후의 독촉 수단입니다.")
+    
+    cd_facts = st.text_area("독촉 사유 요약 (예: 빌려준 1,000만원 미변제)")
     if st.button("내용증명 생성"):
         prompt = f"{snd}가 {rcv}에게 보내는 강력한 내용증명을 작성하라: {cd_facts}"
-        st.write(get_gemini_response(api_key, selected_model, prompt))
+        res = get_gemini_response(api_key, selected_model, prompt)
+        st.text_area("작성 결과", res, height=300)
+        st.download_button("Word 다운로드", create_docx("내용증명서", res), "내용증명.docx")
 
-# --- [TAB 2: 요건 3 & 4 - 형사 고소장 및 전문 용어] ---
+# --- [TAB 2: 요건 3 & 4 - 형사 고소장 및 민사 소장] ---
 with tab2:
     st.subheader("📝 전문 서류 작성 (변호사 보조 모드)")
     
     doc_type = st.radio("서류 유형 선택", ["민사 소장", "형사 고소장"], horizontal=True)
     facts_raw = st.text_area("사건 상세 경위 (기망, 고의, 구성요건 등 전문용어 적용)", height=150)
     
-    # 유형 자동 감지
+    # 유형 자동 감지 (통합된 로직 사용)
     s_label = detect_scenario(facts_raw)
     st.info(f"유형 분석: **{s_label}**")
     
-    st.session_state.amt_in = st.text_input("청구/피해 금액", st.session_state.amt_in)
-    ev_raw = st.text_area("보유 증거 (한 줄에 하나씩)", "차용증\n이체내역서")
-    
-    # 관할 연동 및 에러 방지
-    try: c_idx = COURT_LIST.index(st.session_state.rec_court)
-    except: c_idx = 0
-    sel_court = st.selectbox("제출 법원", COURT_LIST, index=c_idx)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.session_state.amt_in = st.text_input("청구/피해 금액", st.session_state.amt_in)
+    with col_b:
+        # 관할 연동 및 에러 방지
+        try: c_idx = COURT_LIST.index(st.session_state.rec_court)
+        except: c_idx = 0
+        sel_court = st.selectbox("제출 법원", COURT_LIST, index=c_idx)
+
+    ev_raw = st.text_area("보유 증거 (한 줄에 하나씩)", "차용증\n이체내역서\n카톡 대화록")
 
     if st.button("🚀 서류 생성 및 비용 분석"):
         amt, stamp, svc = calculate_legal_costs(st.session_state.amt_in)
         formatted_ev = create_evidence_list_formatted(ev_raw)
         
-        # 요건 4: 전문 용어 적용
+        # 요건 4: 전문 용어 적용 프롬프트
         role_p = "당신은 변호사를 보조하는 전문 법률 비서입니다. 기망, 불법영득의사, 구성요건 등 법률 전문 용어를 사용하세요."
-        prompt = f"{role_p} {doc_type} 작성. 관할: {sel_court}, 금액: {amt}, 내용: {facts_raw}, 입증방법: {formatted_ev}"
+        prompt = f"{role_p} {doc_type} 작성. 관할: {sel_court}, 금액: {amt}, 내용: {facts_raw}, 입증방법: {formatted_ev}, 사건유형: {s_label}"
         
         res = get_gemini_response(api_key, selected_model, prompt)
         st.divider()
         st.markdown(f"### 💰 예상 비용: 인지대 {stamp:,}원 / 송달료 {svc:,}원")
+        
         st.text_area("작성 결과", res, height=350)
         st.download_button("Word 다운로드", create_docx(doc_type, res), f"{doc_type}.docx")
+        
+        if doc_type == "민사 소장":
+             with st.expander("📌 전자소송 및 판결 후 가이드"):
+                st.markdown(f"1. [전자소송 사이트](https://ecfs.scourt.go.kr) 접속\n2. 관할법원 **{sel_court}** 지정\n3. 승소 후 '집행문'을 받아 상대방 통장을 압류할 수 있습니다.")
 
-# --- [TAB 3: 요건 1 & 2 - 타임라인 및 마인드케어] ---
+# --- [TAB 3: 요건 1 & 2 - 타임라인, 마인드케어, 증거분석] ---
 with tab3:
-    st.subheader("⏳ 소송 타임라인 및 마인드케어 (요건 1)")
-    
+    st.subheader("⏳ 소송 타임라인 및 마인드케어")
     
     timeline, _, _, _ = predict_detailed_timeline(st.session_state.amt_in)
     for item in timeline:
@@ -243,12 +288,24 @@ with tab3:
             st.write(f"{item['care']['music']}")
 
     st.divider()
-    st.subheader("🔎 증거 능력 정밀 판독 (요건 2)")
-    ev_input = st.text_area("보유 증거 목록을 입력하세요")
+    st.subheader("🔎 증거 능력 정밀 판독 (AI 분석)")
+    ev_input = st.text_area("분석할 증거 목록을 입력하세요", placeholder="차용증, 녹취록, 문자메시지 등")
     if st.button("증거 전략 분석"):
-        # 요건 2: 핵심/보조 증거 분류
-        p = f"다음 증거를 핵심(직접)증거와 보조(정황)증거로 분류하고 각각의 법적 효력을 정밀 분석하라: {ev_input}"
+        # 요건 2: 핵심/보조 증거 분류 및 별점 평가 통합
+        p = f"다음 증거들의 민사소송상 증거능력을 별점(5점만점)으로 평가하고, 핵심(직접)증거와 보조(정황)증거로 분류하여 법적 효력을 정밀 분석하라: {ev_input}"
         st.markdown(get_gemini_response(api_key, selected_model, p))
+
+# --- [TAB 4: 판례 검색] ---
+with tab4:
+    st.subheader("⚖️ 유사 판례 검색 및 분석")
+    q = st.text_input("판례 키워드")
+    if st.button("검색 및 AI 분석"):
+        if law_id:
+             st.warning("법령센터 API ID가 감지되었습니다. (실제 연동 시 데이터 출력)")
+        else:
+             st.info("API ID 미입력 시 AI가 학습된 데이터를 바탕으로 답변합니다.")
+        
+        st.markdown(get_gemini_response(api_key, selected_model, f"{q}와 관련된 주요 민사 판례 경향을 설명해줘."))
 
 # --- [TAB 5: 요건 5 - 100만 건 데이터 상담봇] ---
 with tab5:
