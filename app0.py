@@ -80,6 +80,17 @@ def get_gemini_response(api_key, model_name, prompt):
         return model.generate_content(prompt).text
     except Exception as e: return f"❌ 오류: {str(e)}"
 
+# [변경 전]: 단순 루프 (단어 순서에 따라 오류 발생 가능)
+# [변경 후]: 단어 길이순 정렬 후 검사 (지능형 매핑)
+def find_best_court(address):
+    if not address: return "법원 직접 선택"
+    # 키워드 길이가 긴 순서대로 정렬 (예: '달서' > '대구')
+    sorted_keys = sorted(JURISDICTION_MAP.keys(), key=len, reverse=True)
+    for key in sorted_keys:
+        if key in address:
+            return JURISDICTION_MAP[key]
+    return "법원 직접 선택"
+
 # 요건 2: 핵심증거와 보조증거 구별 로직
 def analyze_evidence_priority(api_key, model_name, evidence_list):
     prompt = f"""전문 변호사로서 다음 증거들을 '핵심(직접)'과 '보조(정황)'로 분류하고 
